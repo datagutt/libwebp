@@ -166,6 +166,13 @@ static WEBP_INLINE int _mm256_cvtsi256_si32(__m256i a) {
 #endif
 
 //------------------------------------------------------------------------------
+// Xtensa ESP32-S3 PIE defines.
+
+#if defined(__XTENSA__) && defined(CONFIG_IDF_TARGET_ESP32S3)
+#define WEBP_USE_XTENSA_PIE 1
+#endif
+
+//------------------------------------------------------------------------------
 
 #ifndef WEBP_DSP_OMIT_C_CODE
 #define WEBP_DSP_OMIT_C_CODE 1

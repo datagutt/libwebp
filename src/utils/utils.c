@@ -24,6 +24,8 @@
 
 WEBP_ASSUME_UNSAFE_INDEXABLE_ABI
 
+#include "esp_heap_caps.h"
+
 // If PRINT_MEM_INFO is defined, extra info (like total memory used, number of
 // alloc/free etc) is printed. For debugging/tuning purpose only (it's slow,
 // and not multi-thread safe!).
@@ -207,7 +209,7 @@ void* WEBP_SIZED_BY_OR_NULL(nmemb* size)
   Increment(&num_malloc_calls);
   if (!CheckSizeArgumentsOverflow(nmemb, size)) return NULL;
   assert(nmemb * size > 0);
-  ptr = malloc((size_t)(nmemb * size));
+  ptr = heap_caps_malloc((size_t)(nmemb * size), MALLOC_CAP_SPIRAM);
   AddMem(ptr, (size_t)(nmemb * size));
   return WEBP_UNSAFE_FORGE_BIDI_INDEXABLE(void*, ptr, (size_t)(nmemb * size));
 }
@@ -218,7 +220,7 @@ void* WEBP_SIZED_BY_OR_NULL(nmemb* size)
   Increment(&num_calloc_calls);
   if (!CheckSizeArgumentsOverflow(nmemb, size)) return NULL;
   assert(nmemb * size > 0);
-  ptr = calloc((size_t)nmemb, size);
+  ptr = heap_caps_calloc((size_t)nmemb, size, MALLOC_CAP_SPIRAM);
   AddMem(ptr, (size_t)(nmemb * size));
   return WEBP_UNSAFE_FORGE_BIDI_INDEXABLE(void*, ptr, (size_t)(nmemb * size));
 }
@@ -228,7 +230,7 @@ void WebPSafeFree(void* const ptr) {
     Increment(&num_free_calls);
     SubMem(ptr);
   }
-  free(ptr);
+  heap_caps_free(ptr);
 }
 
 // Public API functions.
