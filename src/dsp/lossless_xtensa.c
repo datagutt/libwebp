@@ -9,8 +9,11 @@
 //   - VP8LAddGreenToBlueAndRed: inverse of the subtract-green transform,
 //     present in virtually every VP8L stream.
 //   - VP8LConvertBGRAToRGBA: final canvas conversion for MODE_RGBA output.
+//   - PredictorAdd0/PredictorAdd2: inverse of the black and top predictors,
+//     the two spatial predictors that both vectorize (no dependence on the
+//     just-decoded left pixel) and keep upper/in/out 16-byte congruent.
 //
-// Both process 4 pixels (16 bytes) per iteration in PIE Q registers.
+// All process 4 pixels (16 bytes) per iteration in PIE Q registers.
 //
 // Safety: PIE shift/add lane semantics are hard to verify off-device, so
 // VP8LDspInitXtensa() runs each vector function against the C reference on a
@@ -25,6 +28,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "src/dsp/lossless.h"
+#include "src/dsp/lossless_common.h"
 #include "src/dsp/xtensa_pie.h"
 
 //------------------------------------------------------------------------------
@@ -160,6 +164,109 @@ static void VP8LConvertBGRAToRGBA_Xtensa(const uint32_t* WEBP_RESTRICT src,
 }
 
 //------------------------------------------------------------------------------
+// Predictor inverse (add) for the black and top predictors.
+//
+// out[i] = in[i] + pred (per byte, mod 256), with pred = 0xff000000 for
+// predictor 0 and pred = upper[i] for predictor 2.
+//
+// PIE has no wrapping byte add and EE.VADDS.S32 saturates when the alpha
+// bytes are large, so the add runs split across two EE.VADDS.S16 passes:
+// even bytes [B][R] as (v & 0x00ff00ff) and odd bytes [G][A] as
+// ((v >> 8) & 0x00ff00ff). Each 16-bit lane then holds one byte value
+// (max sum 510), signed saturation never triggers, and the 0x00ff00ff mask
+// afterwards provides the per-byte wraparound. SAR stays 8 for both the
+// odd-byte extraction (VSR) and the recombine (VSL).
+
+static const uint32_t kArgbBlack = 0xff000000u;
+// Odd-byte plane of ARGB_BLACK: ((0xff000000 >> 8) & 0x00ff00ff)
+static const uint32_t kBlackOddBytes = 0x00ff0000u;
+
+static void PredictorAdd0_Xtensa(const uint32_t* in, const uint32_t* upper,
+                                 int num_pixels, uint32_t* WEBP_RESTRICT out) {
+    (void)upper;
+    if ((((uintptr_t)in ^ (uintptr_t)out) & 15u) != 0) {
+        VP8LPredictorsAdd_C[0](in, NULL, num_pixels, out);
+        return;
+    }
+
+    while (num_pixels > 0 && ((uintptr_t)in & 15u) != 0) {
+        *out++ = VP8LAddPixels(*in++, kArgbBlack);
+        --num_pixels;
+    }
+
+    int n = num_pixels >> 2;
+    if (n > 0) {
+        num_pixels -= n << 2;
+
+        PIE_VLDBC_32(q7, &kMaskRedBlue);    // even/odd byte-plane mask
+        PIE_VLDBC_32(q6, &kBlackOddBytes);  // [G+0][A+0xff] addend
+        PIE_SET_SAR(8);
+
+        while (n-- > 0) {
+            PIE_VLD_128_IP(q0, in);
+            PIE_ANDQ(q2, q0, q7);       // even bytes: += 0, pass through
+            PIE_VSR_32(q4, q0);
+            PIE_ANDQ(q4, q4, q7);       // odd bytes [G][A]
+            PIE_VADDS_S16(q4, q4, q6);  // A += 0xff, no saturation possible
+            PIE_ANDQ(q4, q4, q7);       // per-byte wrap
+            PIE_VSL_32(q4, q4);         // back to G/A positions
+            PIE_ORQ(q2, q2, q4);
+            PIE_VST_128_IP(q2, out);
+        }
+    }
+
+    while (num_pixels-- > 0) {
+        *out++ = VP8LAddPixels(*in++, kArgbBlack);
+    }
+}
+
+static void PredictorAdd2_Xtensa(const uint32_t* in, const uint32_t* upper,
+                                 int num_pixels, uint32_t* WEBP_RESTRICT out) {
+    // upper is one canvas row above out, so for the row widths this firmware
+    // decodes (multiples of 4 pixels) all three stay 16-byte congruent.
+    if (((((uintptr_t)in ^ (uintptr_t)out) |
+          ((uintptr_t)in ^ (uintptr_t)upper)) & 15u) != 0) {
+        VP8LPredictorsAdd_C[2](in, upper, num_pixels, out);
+        return;
+    }
+
+    while (num_pixels > 0 && ((uintptr_t)in & 15u) != 0) {
+        *out++ = VP8LAddPixels(*in++, *upper++);
+        --num_pixels;
+    }
+
+    int n = num_pixels >> 2;
+    if (n > 0) {
+        num_pixels -= n << 2;
+
+        PIE_VLDBC_32(q7, &kMaskRedBlue);
+        PIE_SET_SAR(8);
+
+        while (n-- > 0) {
+            PIE_VLD_128_IP(q0, in);
+            PIE_VLD_128_IP(q1, upper);
+            PIE_ANDQ(q2, q0, q7);       // in even bytes [B][R]
+            PIE_ANDQ(q3, q1, q7);       // upper even bytes
+            PIE_VADDS_S16(q2, q2, q3);  // byte sums <= 510, no saturation
+            PIE_ANDQ(q2, q2, q7);       // per-byte wrap
+            PIE_VSR_32(q4, q0);
+            PIE_ANDQ(q4, q4, q7);       // in odd bytes [G][A]
+            PIE_VSR_32(q5, q1);
+            PIE_ANDQ(q5, q5, q7);       // upper odd bytes
+            PIE_VADDS_S16(q4, q4, q5);
+            PIE_ANDQ(q4, q4, q7);
+            PIE_VSL_32(q4, q4);         // back to G/A positions
+            PIE_ORQ(q2, q2, q4);
+            PIE_VST_128_IP(q2, out);
+        }
+    }
+
+    while (num_pixels-- > 0) {
+        *out++ = VP8LAddPixels(*in++, *upper++);
+    }
+}
+
+//------------------------------------------------------------------------------
 // Init-time self-check: run PIE and C implementations over byte patterns that
 // exercise sign bits, carries and wraparound, plus unaligned heads and tails.
 // Install the PIE version only on an exact output match.
@@ -199,6 +306,35 @@ static int CheckAddGreen(void) {
     return memcmp(out_c, out_pie, sizeof(out_c)) == 0;
 }
 
+// Both predictor checks share this driver: the C reference comes from
+// VP8LPredictorsAdd_C, which VP8LDspInit populates before calling the
+// per-arch init functions.
+static int CheckPredictorAdd(int pred, VP8LPredictorAddSubFunc pie_func) {
+    PIE_ALIGN static uint32_t in[PIE_CHECK_PIXELS];
+    PIE_ALIGN static uint32_t up[PIE_CHECK_PIXELS];
+    PIE_ALIGN static uint32_t out_c[PIE_CHECK_PIXELS];
+    PIE_ALIGN static uint32_t out_pie[PIE_CHECK_PIXELS];
+    int i;
+    FillCheckInput(in);
+    for (i = 0; i < PIE_CHECK_PIXELS; ++i) {
+        up[i] = in[PIE_CHECK_PIXELS - 1 - i] ^ 0xa5a5a5a5u;
+    }
+
+    // Aligned, vector body + tail (30 = head 0, body 28, tail 2)
+    memset(out_c, 0, sizeof(out_c));
+    memset(out_pie, 0, sizeof(out_pie));
+    VP8LPredictorsAdd_C[pred](in, up, 30, out_c);
+    pie_func(in, up, 30, out_pie);
+    if (memcmp(out_c, out_pie, sizeof(out_c)) != 0) return 0;
+
+    // Unaligned head (all pointers stay congruent mod 16)
+    memset(out_c, 0, sizeof(out_c));
+    memset(out_pie, 0, sizeof(out_pie));
+    VP8LPredictorsAdd_C[pred](in + 1, up + 1, 27, out_c + 1);
+    pie_func(in + 1, up + 1, 27, out_pie + 1);
+    return memcmp(out_c, out_pie, sizeof(out_c)) == 0;
+}
+
 static int CheckConvertBGRAToRGBA(void) {
     PIE_ALIGN static uint32_t in[PIE_CHECK_PIXELS];
     PIE_ALIGN static uint8_t out_c[PIE_CHECK_PIXELS * 4];
@@ -233,6 +369,16 @@ WEBP_TSAN_IGNORE_FUNCTION void VP8LDspInitXtensa(void) {
         VP8LConvertBGRAToRGBA = VP8LConvertBGRAToRGBA_Xtensa;
     } else {
         printf("libwebp: PIE ConvertBGRAToRGBA self-check failed, using C\n");
+    }
+    if (CheckPredictorAdd(0, PredictorAdd0_Xtensa)) {
+        VP8LPredictorsAdd[0] = PredictorAdd0_Xtensa;
+    } else {
+        printf("libwebp: PIE PredictorAdd0 self-check failed, using C\n");
+    }
+    if (CheckPredictorAdd(2, PredictorAdd2_Xtensa)) {
+        VP8LPredictorsAdd[2] = PredictorAdd2_Xtensa;
+    } else {
+        printf("libwebp: PIE PredictorAdd2 self-check failed, using C\n");
     }
 }
 
