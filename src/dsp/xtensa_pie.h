@@ -197,6 +197,26 @@
         : : : \
     )
 
+// Set the SAR_BYTE register (byte shift amount for EE.SRC.Q)
+#define PIE_SET_SAR_BYTE(amount) \
+    do { \
+        const uint32_t _pie_sar_byte = (amount); \
+        __asm__ volatile ("wur.sar_byte %0" : : "a"(_pie_sar_byte)); \
+    } while (0)
+
+// Funnel shift across two Q registers: dst = low 128 bits of
+// ({high:low} >> (8 * SAR_BYTE)), i.e. dst byte j comes from low[j + S]
+// while j + S < 16, then from high[j + S - 16].
+//
+// The operand order ({high:low} vs {low:high}) is hard to verify off-device;
+// every user of this macro must go through an init-time self-check against
+// the C reference and fall back to C on mismatch.
+#define PIE_SRC_Q(dst, low, high) \
+    __asm__ volatile ( \
+        "ee.src.q " #dst ", " #low ", " #high \
+        : : : \
+    )
+
 //------------------------------------------------------------------------------
 // Clipping/saturation helpers
 
