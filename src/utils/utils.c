@@ -180,6 +180,25 @@ static void SubMem(void* ptr) {
   } while (0)
 #endif
 
+// Allocation policy for ESP32: small allocations (Huffman tables, decoder
+// state) sit on the decode hot path with random access patterns, so they
+// prefer internal RAM where a cache miss is cheap. Large buffers (pixel
+// canvases, scratch rows) would not fit internal RAM sustainably and go
+// straight to PSRAM. Internal RAM is shared with WiFi/TLS, so the threshold
+// bounds libwebp's internal footprint and PSRAM remains the fallback.
+#define WEBP_INTERNAL_ALLOC_MAX (16 * 1024)
+
+static void* HeapAlloc(size_t total_size) {
+  void* ptr = NULL;
+  if (total_size <= WEBP_INTERNAL_ALLOC_MAX) {
+    ptr = heap_caps_malloc(total_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  }
+  if (ptr == NULL) {
+    ptr = heap_caps_malloc(total_size, MALLOC_CAP_SPIRAM);
+  }
+  return ptr;
+}
+
 // Returns 0 in case of overflow of nmemb * size.
 static int CheckSizeArgumentsOverflow(uint64_t nmemb, size_t size) {
   const uint64_t total_size = nmemb * size;
@@ -209,7 +228,7 @@ void* WEBP_SIZED_BY_OR_NULL(nmemb* size)
   Increment(&num_malloc_calls);
   if (!CheckSizeArgumentsOverflow(nmemb, size)) return NULL;
   assert(nmemb * size > 0);
-  ptr = heap_caps_malloc((size_t)(nmemb * size), MALLOC_CAP_SPIRAM);
+  ptr = HeapAlloc((size_t)(nmemb * size));
   AddMem(ptr, (size_t)(nmemb * size));
   return WEBP_UNSAFE_FORGE_BIDI_INDEXABLE(void*, ptr, (size_t)(nmemb * size));
 }
@@ -220,7 +239,8 @@ void* WEBP_SIZED_BY_OR_NULL(nmemb* size)
   Increment(&num_calloc_calls);
   if (!CheckSizeArgumentsOverflow(nmemb, size)) return NULL;
   assert(nmemb * size > 0);
-  ptr = heap_caps_calloc((size_t)nmemb, size, MALLOC_CAP_SPIRAM);
+  ptr = HeapAlloc((size_t)(nmemb * size));
+  if (ptr != NULL) memset(ptr, 0, (size_t)(nmemb * size));
   AddMem(ptr, (size_t)(nmemb * size));
   return WEBP_UNSAFE_FORGE_BIDI_INDEXABLE(void*, ptr, (size_t)(nmemb * size));
 }
