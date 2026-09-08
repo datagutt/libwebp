@@ -37,7 +37,7 @@ src/webp/stamp-h1
 *.pdb
 /iosbuild
 /xcframeworkbuild
-/WebP*.*framework
+/*.*framework
 CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
@@ -54,4 +54,5 @@ tests/fuzzer/demux_api_fuzzer
 tests/fuzzer/enc_dec_fuzzer
 tests/fuzzer/huffman_fuzzer
 tests/fuzzer/mux_demux_api_fuzzer
+tests/fuzzer/sharpyuv_fuzzer
 tests/fuzzer/simple_api_fuzzer

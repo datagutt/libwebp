@@ -168,13 +168,13 @@ int VP8RecordCoeffTokens(int ctx, const struct VP8Residual* const res,
           tab = VP8Cat4;
         } else if (residue < (8 << 3)) {  // VP8Cat5  (5b)
           AddToken(tokens, 1, base_id + 8, s + 8);
-          AddToken(tokens, 0, base_id + 10, s + 9);
+          AddToken(tokens, 0, base_id + 10, s + 10);
           residue -= (8 << 2);
           mask = 1 << 4;
           tab = VP8Cat5;
         } else {  // VP8Cat6 (11b)
           AddToken(tokens, 1, base_id + 8, s + 8);
-          AddToken(tokens, 1, base_id + 10, s + 9);
+          AddToken(tokens, 1, base_id + 10, s + 10);
           residue -= (8 << 3);
           mask = 1 << 10;
           tab = VP8Cat6;

@@ -167,7 +167,7 @@ AC_ARG_ENABLE([avx2],
                              [Disable detection of AVX2 support
                               @<:@default=auto@:>@]))
 
-AS_IF([test "x$enable_avx2" != "xno" -a "x$enable_sse4_1" != "xno"
+AS_IF([test "x$enable_avx2" != "xno" -a "x$enable_sse4_1" != "xno" \
       -a "x$enable_sse2" != "xno"], [
   AVX2_FLAGS="$INTRINSICS_CFLAGS $AVX2_FLAGS"
   TEST_AND_ADD_CFLAGS([AVX2_FLAGS], [-mavx2])
@@ -288,6 +288,33 @@ AS_IF([test "x$enable_neon" != "xno"], [
       ;;
   esac
   AC_SUBST([NEON_FLAGS])])
+
+AC_ARG_ENABLE([vsx],
+              AS_HELP_STRING([--disable-vsx],
+                             [Disable detection of VSX support
+                              @<:@default=auto@:>@]))
+
+AS_IF([test "x$enable_vsx" != "xno"], [
+  case "$host_cpu" in
+    powerpc64*|ppc64*)
+      VSX_FLAGS="$INTRINSICS_CFLAGS $VSX_FLAGS"
+      TEST_AND_ADD_CFLAGS([VSX_FLAGS], [-mvsx])
+      AS_IF([test -n "$VSX_FLAGS"], [
+        SAVED_CFLAGS=$CFLAGS
+        CFLAGS="$CFLAGS $VSX_FLAGS"
+        AC_COMPILE_IFELSE([AC_LANG_SOURCE([
+          #include <altivec.h>
+          int main(void) {
+            vector signed int v = vec_splat_s32(0);
+            (void)v;
+            return 0;
+          }])],
+          [AC_DEFINE(WEBP_HAVE_VSX, [1], [Set to 1 if VSX is supported])],
+          [VSX_FLAGS=""])
+        CFLAGS=$SAVED_CFLAGS])
+      AC_SUBST([VSX_FLAGS])
+      ;;
+  esac])
 
 dnl === CLEAR_LIBVARS([var_pfx])
 dnl ===   Clears <var_pfx>_{INCLUDES,LIBS}.

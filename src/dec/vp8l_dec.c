@@ -246,7 +246,9 @@ static int ReadHuffmanCodeLengths(VP8LDecoder* const dec,
                                   const int* const code_length_code_lengths,
                                   int num_symbols, int* const code_lengths) {
   int ok = 0;
+  VP8StatusCode status = VP8_STATUS_BITSTREAM_ERROR;
   VP8LBitReader* const br = &dec->br;
+  int size;
   int symbol;
   int max_symbol;
   int prev_code_len = DEFAULT_CODE_LENGTH;
@@ -256,11 +258,14 @@ static int ReadHuffmanCodeLengths(VP8LDecoder* const dec,
           const int*, code_length_code_lengths,
           NUM_CODE_LENGTH_CODES * sizeof(*code_length_code_lengths));
 
-  if (!VP8LHuffmanTablesAllocate(1 << LENGTHS_TABLE_BITS, &tables) ||
-      !VP8LBuildHuffmanTable(&tables, LENGTHS_TABLE_BITS, bounded_code_lengths,
-                             NUM_CODE_LENGTH_CODES)) {
+  if (!VP8LHuffmanTablesAllocate(1 << LENGTHS_TABLE_BITS, &tables)) {
+    status = VP8_STATUS_OUT_OF_MEMORY;
     goto End;
   }
+  size = VP8LBuildHuffmanTable(&tables, LENGTHS_TABLE_BITS,
+                               bounded_code_lengths, NUM_CODE_LENGTH_CODES);
+  if (size < 0) status = VP8_STATUS_OUT_OF_MEMORY;
+  if (size <= 0) goto End;
 
   if (VP8LReadBits(br, 1)) {  // use length
     const int length_nbits = 2 + 2 * VP8LReadBits(br, 3);
@@ -302,7 +307,7 @@ static int ReadHuffmanCodeLengths(VP8LDecoder* const dec,
 
 End:
   VP8LHuffmanTablesDeallocate(&tables);
-  if (!ok) return VP8LSetError(dec, VP8_STATUS_BITSTREAM_ERROR);
+  if (!ok) return VP8LSetError(dec, status);
   return ok;
 }
 
@@ -323,6 +328,7 @@ static int ReadHuffmanCode(int alphabet_size, VP8LDecoder* const dec,
     const int first_symbol_len_code = VP8LReadBits(br, 1);
     // The first code is either 1 bit or 8 bit code.
     int symbol = VP8LReadBits(br, (first_symbol_len_code == 0) ? 1 : 8);
+    // 'symbol' can exceed 'alphabet_size', but not code_lengths[]'s size.
     code_lengths[symbol] = 1;
     // The second code (if present), is always 8 bits long.
     if (num_symbols == 2) {
@@ -351,8 +357,9 @@ static int ReadHuffmanCode(int alphabet_size, VP8LDecoder* const dec,
     size = VP8LBuildHuffmanTable(table, HUFFMAN_TABLE_BITS,
                                  bounded_code_lengths, alphabet_size);
   }
-  if (!ok || size == 0) {
-    return VP8LSetError(dec, VP8_STATUS_BITSTREAM_ERROR);
+  if (!ok || size <= 0) {
+    return VP8LSetError(dec, (size < 0) ? VP8_STATUS_OUT_OF_MEMORY
+                                        : VP8_STATUS_BITSTREAM_ERROR);
   }
   return size;
 }
@@ -397,10 +404,11 @@ static int ReadHuffmanCodes(VP8LDecoder* const dec, int xsize, int ysize,
     // Check the validity of num_htree_groups_max. If it seems too big, use a
     // smaller value for later. This will prevent big memory allocations to end
     // up with a bad bitstream anyway.
-    // The value of 1000 is totally arbitrary. We know that num_htree_groups_max
-    // is smaller than (1 << 16) and should be smaller than the number of pixels
-    // (though the format allows it to be bigger).
-    if (num_htree_groups_max > 1000 || num_htree_groups_max > xsize * ysize) {
+    // The value of 200 is arbitrary but the encoder of the current code usually
+    // does not go above that value. We also know that num_htree_groups_max is
+    // smaller than (1 << 16) and should be smaller than the number of pixels in
+    // the Huffman image (though the format allows it to be bigger).
+    if (num_htree_groups_max > 200 || num_htree_groups_max > huffman_pixs) {
       // Create a mapping from the used indices to the minimal set of used
       // values [0, num_htree_groups)
       mapping = (int*)WebPSafeMalloc(num_htree_groups_max, sizeof(*mapping));
@@ -417,6 +425,12 @@ static int ReadHuffmanCodes(VP8LDecoder* const dec, int xsize, int ysize,
         int* const mapped_group = &mapping[huffman_image[i]];
         if (*mapped_group == -1) *mapped_group = num_htree_groups++;
         huffman_image[i] = *mapped_group;
+      }
+      if (num_htree_groups == num_htree_groups_max) {
+        // No remapping is needed.
+        WebPSafeFree(mapping);
+        mapping = NULL;
+        num_htree_groups = num_htree_groups_max;
       }
     } else {
       num_htree_groups = num_htree_groups_max;
@@ -1120,79 +1134,81 @@ static int DecodeAlphaData(VP8LDecoder* const dec, uint8_t* const data,
   int col = dec->last_pixel % width;
   VP8LBitReader* const br = &dec->br;
   VP8LMetadata* const hdr = &dec->hdr;
-  int pos = dec->last_pixel;          // current position
-  const int end = width * height;     // End of data
-  const int last = width * last_row;  // Last pixel to decode
+  uint8_t* src = data + dec->last_pixel;
+  // End of data.
+  const uint8_t* const src_end = data + width * height;
+  // Last pixel to decode.
+  const uint8_t* const src_last = data + width * last_row;
   const int len_code_limit = NUM_LITERAL_CODES + NUM_LENGTH_CODES;
   const int mask = hdr->huffman_mask;
-  const HTreeGroup* htree_group =
-      (pos < last) ? GetHtreeGroupForPos(hdr, col, row) : NULL;
-  assert(pos <= end);
+  assert(src <= src_end);
   assert(last_row <= height);
   assert(Is8bOptimizable(hdr));
 
-  while (!br->eos && pos < last) {
-    int code;
-    // Only update when changing tile.
-    if ((col & mask) == 0) {
-      htree_group = GetHtreeGroupForPos(hdr, col, row);
+  while (!br->eos && src < src_last) {
+    const HTreeGroup* htree_group = GetHtreeGroupForPos(hdr, col, row);
+    // Beginning of a block or inside a block if we reached it through a
+    // backward reference.
+    const uint8_t* const block_start = src;
+    const uint8_t* block_end;
+    if (mask == ~0) {
+      // No block, we decode until src_last.
+      block_end = src_last;
+    } else {
+      const uint32_t block_size_left = mask + 1 - (col & mask);
+      const uint32_t line_size_left = width - col;
+      // End of the block if it is full, or end of the line.
+      block_end = src + (block_size_left < line_size_left ? block_size_left
+                                                          : line_size_left);
     }
-    assert(htree_group != NULL);
-    VP8LFillBitWindow(br);
-    code = ReadSymbol(htree_group->htrees[GREEN], br);
-    if (code < NUM_LITERAL_CODES) {  // Literal
-      data[pos] = code;
-      ++pos;
-      ++col;
-      if (col >= width) {
-        col = 0;
-        ++row;
-        if (row <= last_row && (row % NUM_ARGB_CACHE_ROWS == 0)) {
-          ExtractPalettedAlphaRows(dec, row);
-        }
-      }
-    } else if (code < len_code_limit) {  // Backward reference
-      int dist_code, dist;
-      const int length_sym = code - NUM_LITERAL_CODES;
-      const int length = GetCopyLength(length_sym, br);
-      const int dist_symbol = ReadSymbol(htree_group->htrees[DIST], br);
+    for (; !br->eos && src < block_end;) {
+      int code;
       VP8LFillBitWindow(br);
-      dist_code = GetCopyDistance(dist_symbol, br);
-      dist = PlaneCodeToDistance(width, dist_code);
-      if (pos >= dist && end - pos >= length) {
-        CopyBlock8b(data + pos, dist, length);
-      } else {
+      code = ReadSymbol(htree_group->htrees[GREEN], br);
+      if (code < NUM_LITERAL_CODES) {  // Literal
+        *src = code;
+        ++src;
+      } else if (code < len_code_limit) {  // Backward reference
+        int dist_code, dist;
+        const int length_sym = code - NUM_LITERAL_CODES;
+        const int length = GetCopyLength(length_sym, br);
+        const int dist_symbol = ReadSymbol(htree_group->htrees[DIST], br);
+        VP8LFillBitWindow(br);
+        dist_code = GetCopyDistance(dist_symbol, br);
+        dist = PlaneCodeToDistance(width, dist_code);
+        if (src - data >= (ptrdiff_t)dist &&
+            src_end - src >= (ptrdiff_t)length) {
+          CopyBlock8b(src, dist, length);
+        } else {
+          ok = 0;
+          goto End;
+        }
+        src += length;
+      } else {  // Not reached
         ok = 0;
         goto End;
       }
-      pos += length;
-      col += length;
-      while (col >= width) {
-        col -= width;
-        ++row;
-        if (row <= last_row && (row % NUM_ARGB_CACHE_ROWS == 0)) {
-          ExtractPalettedAlphaRows(dec, row);
-        }
-      }
-      if (pos < last && (col & mask)) {
-        htree_group = GetHtreeGroupForPos(hdr, col, row);
-      }
-    } else {  // Not reached
-      ok = 0;
-      goto End;
+      br->eos = VP8LIsEndOfStream(br);
     }
-    br->eos = VP8LIsEndOfStream(br);
+    col += (int)(src - block_start);
+    while (col >= width) {
+      col -= width;
+      ++row;
+      if (row <= last_row && (row % NUM_ARGB_CACHE_ROWS == 0)) {
+        ExtractPalettedAlphaRows(dec, row);
+      }
+    }
   }
   // Process the remaining rows corresponding to last row-block.
   ExtractPalettedAlphaRows(dec, row > last_row ? last_row : row);
 
 End:
   br->eos = VP8LIsEndOfStream(br);
-  if (!ok || (br->eos && pos < end)) {
+  if (!ok || (br->eos && src < src_end)) {
     return VP8LSetError(
         dec, br->eos ? VP8_STATUS_SUSPENDED : VP8_STATUS_BITSTREAM_ERROR);
   }
-  dec->last_pixel = pos;
+  dec->last_pixel = (int)(src - data);
   return ok;
 }
 
@@ -1263,9 +1279,9 @@ static int DecodeImageData(VP8LDecoder* const dec, uint32_t* const data,
     } else {
       code = ReadSymbol(htree_group->htrees[GREEN], br);
     }
-    if (VP8LIsEndOfStream(br)) break;
     if (code < NUM_LITERAL_CODES) {  // Literal
       if (htree_group->is_trivial_literal) {
+        if (VP8LIsEndOfStream(br)) break;
         *src = htree_group->literal_arb | (code << 8);
       } else {
         int red, blue, alpha;
@@ -1331,6 +1347,7 @@ static int DecodeImageData(VP8LDecoder* const dec, uint32_t* const data,
     } else if (code < color_cache_limit) {  // Color cache
       const int key = code - len_code_limit;
       assert(color_cache != NULL);
+      if (VP8LIsEndOfStream(br)) break;
       while (last_cached < src) {
         VP8LColorCacheInsert(color_cache, *last_cached++);
       }
@@ -1408,8 +1425,8 @@ static int ExpandColorMap(int num_colors, VP8LTransform* const transform) {
   return 1;
 }
 
-static int ReadTransform(int* const xsize, int const* ysize,
-                         VP8LDecoder* const dec) {
+// Only 'xsize' can be modified (by COLOR_INDEXING_TRANSFORM).
+static int ReadTransform(int* const xsize, int ysize, VP8LDecoder* const dec) {
   int ok = 1;
   VP8LBitReader* const br = &dec->br;
   VP8LTransform* transform = &dec->transforms[dec->next_transform];
@@ -1424,7 +1441,7 @@ static int ReadTransform(int* const xsize, int const* ysize,
 
   transform->type = type;
   transform->xsize = *xsize;
-  transform->ysize = *ysize;
+  transform->ysize = ysize;
   transform->data = NULL;
   ++dec->next_transform;
   assert(dec->next_transform <= NUM_TRANSFORMS);
@@ -1497,6 +1514,15 @@ VP8LDecoder* VP8LNew(void) {
   return dec;
 }
 
+// Frees dec->pixels along with the sub-slice pointers derived from it, to
+// prevent dangling references.
+static void ClearInternalBuffers(VP8LDecoder* const dec) {
+  WebPSafeFree(dec->pixels);
+  dec->pixels = NULL;
+  dec->argb_cache = NULL;
+  dec->accumulated_rgb_pixels = NULL;
+}
+
 // Resets the decoder in its initial state, reclaiming memory.
 // Preserves the dec->status value.
 static void VP8LClear(VP8LDecoder* const dec) {
@@ -1504,8 +1530,7 @@ static void VP8LClear(VP8LDecoder* const dec) {
   if (dec == NULL) return;
   ClearMetadata(&dec->hdr);
 
-  WebPSafeFree(dec->pixels);
-  dec->pixels = NULL;
+  ClearInternalBuffers(dec);
   for (i = 0; i < dec->next_transform; ++i) {
     ClearTransform(&dec->transforms[i]);
   }
@@ -1549,7 +1574,7 @@ static int DecodeImageStream(int xsize, int ysize, int is_level0,
   // Read the transforms (may recurse).
   if (is_level0) {
     while (ok && VP8LReadBits(br, 1)) {
-      ok = ReadTransform(&transform_xsize, &transform_ysize, dec);
+      ok = ReadTransform(&transform_xsize, transform_ysize, dec);
     }
   }
 
@@ -1627,7 +1652,7 @@ static int AllocateInternalBuffers32b(VP8LDecoder* const dec, int final_width) {
   const uint64_t num_pixels = (uint64_t)dec->width * dec->height;
   // Scratch buffer corresponding to top-prediction row for transforming the
   // first row in the row-blocks. Not needed for paletted alpha.
-  const uint64_t cache_top_pixels = (uint16_t)final_width;
+  const uint64_t cache_top_pixels = final_width;
   // Scratch buffer for temporary BGRA storage. Not needed for paletted alpha.
   const uint64_t cache_pixels = (uint64_t)final_width * NUM_ARGB_CACHE_ROWS;
   // Scratch buffer to accumulate RGBA values (hence 4*)for YUV conversion.
@@ -1643,7 +1668,7 @@ static int AllocateInternalBuffers32b(VP8LDecoder* const dec, int final_width) {
   assert(dec->width <= final_width);
   dec->pixels = (uint32_t*)WebPSafeMalloc(total_num_pixels, sizeof(uint32_t));
   if (dec->pixels == NULL) {
-    dec->argb_cache = NULL;  // for soundness
+    ClearInternalBuffers(dec);
     return VP8LSetError(dec, VP8_STATUS_OUT_OF_MEMORY);
   }
   dec->argb_cache = dec->pixels + num_pixels + cache_top_pixels;
@@ -1658,7 +1683,7 @@ static int AllocateInternalBuffers32b(VP8LDecoder* const dec, int final_width) {
 
 static int AllocateInternalBuffers8b(VP8LDecoder* const dec) {
   const uint64_t total_num_pixels = (uint64_t)dec->width * dec->height;
-  dec->argb_cache = NULL;  // for soundness
+  ClearInternalBuffers(dec);
   dec->pixels = (uint32_t*)WebPSafeMalloc(total_num_pixels, sizeof(uint8_t));
   if (dec->pixels == NULL) {
     return VP8LSetError(dec, VP8_STATUS_OUT_OF_MEMORY);
@@ -1701,13 +1726,14 @@ static void ExtractAlphaRows(VP8LDecoder* const dec, int last_row,
   dec->last_row = dec->last_out_row = last_row;
 }
 
-int VP8LDecodeAlphaHeader(ALPHDecoder* const alph_dec,
-                          const uint8_t* const WEBP_COUNTED_BY(data_size) data,
-                          size_t data_size) {
+VP8StatusCode VP8LDecodeAlphaHeader(
+    ALPHDecoder* const alph_dec,
+    const uint8_t* const WEBP_COUNTED_BY(data_size) data, size_t data_size) {
+  VP8StatusCode status;
   int ok = 0;
   VP8LDecoder* dec = VP8LNew();
 
-  if (dec == NULL) return 0;
+  if (dec == NULL) return VP8_STATUS_OUT_OF_MEMORY;
 
   assert(alph_dec != NULL);
 
@@ -1744,11 +1770,14 @@ int VP8LDecodeAlphaHeader(ALPHDecoder* const alph_dec,
 
   // Only set here, once we are sure it is valid (to avoid thread races).
   alph_dec->vp8l_dec = dec;
-  return 1;
+  return VP8_STATUS_OK;
 
 Err:
+  // The whole ALPH chunk is available, so SUSPENDED means a truncated stream.
+  status = (dec->status == VP8_STATUS_SUSPENDED) ? VP8_STATUS_BITSTREAM_ERROR
+                                                 : dec->status;
   VP8LDelete(dec);
-  return 0;
+  return status;
 }
 
 int VP8LDecodeAlphaImageStream(ALPHDecoder* const alph_dec, int last_row) {

@@ -180,7 +180,7 @@ static int AndroidCPUInfo(CPUFeature feature) {
 }
 WEBP_EXTERN VP8CPUInfo VP8GetCPUInfo;
 VP8CPUInfo VP8GetCPUInfo = AndroidCPUInfo;
-#elif defined(EMSCRIPTEN)         // also needs to be before generic NEON test
+#elif defined(__EMSCRIPTEN__)     // also needs to be before generic NEON test
 // Use compile flags as an indicator of SIMD support instead of a runtime check.
 static int wasmCPUInfo(CPUFeature feature) {
   switch (feature) {
@@ -192,6 +192,10 @@ static int wasmCPUInfo(CPUFeature feature) {
     case kSSE3:
     case kSlowSSSE3:
     case kSSE4_1:
+      return 1;
+#endif
+#ifdef WEBP_HAVE_AVX2
+    case kAVX2:
       return 1;
 #endif
 #ifdef WEBP_HAVE_NEON
@@ -245,6 +249,18 @@ static int mipsCPUInfo(CPUFeature feature) {
 }
 WEBP_EXTERN VP8CPUInfo VP8GetCPUInfo;
 VP8CPUInfo VP8GetCPUInfo = mipsCPUInfo;
+#elif defined(WEBP_USE_VSX)
+// VSX is the POWER8 (ISA 2.07) baseline, so compile-time presence implies
+// runtime availability.
+static int ppcCPUInfo(CPUFeature feature) {
+  if (feature == kVSX) {
+    return 1;
+  } else {
+    return 0;
+  }
+}
+WEBP_EXTERN VP8CPUInfo VP8GetCPUInfo;
+VP8CPUInfo VP8GetCPUInfo = ppcCPUInfo;
 #else
 WEBP_EXTERN VP8CPUInfo VP8GetCPUInfo;
 VP8CPUInfo VP8GetCPUInfo = NULL;

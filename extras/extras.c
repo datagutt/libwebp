@@ -237,8 +237,10 @@ static int DoEstimateRisk(const uint8_t* r_ptr, const uint8_t* g_ptr,
                         precomputed_scores_table_sampling *
                         precomputed_scores_table_sampling;
   const int kNoiseLevel = 4;
-  double total_score = 0;
-  double count = 0;
+  // int64_t accumulation is potentially faster than double.
+  int64_t sum = 0;
+  int64_t count = 0;
+  double total_score;
   // Rows of indices in
   uint16_t* row1 = SAFE_ALLOC(width, 1, uint16_t);
   uint16_t* row2 = SAFE_ALLOC(width, 1, uint16_t);
@@ -276,12 +278,12 @@ static int DoEstimateRisk(const uint8_t* r_ptr, const uint8_t* g_ptr,
                         precomputed_scores_table[idx0 + sampling3 * idx2] +
                         precomputed_scores_table[idx1 + sampling3 * idx2];
       if (score > kNoiseLevel) {
-        total_score += score;
-        count += 1.0;
+        sum += score;
+        ++count;
       }
     }
   }
-  if (count > 0.) total_score /= count;
+  total_score = (count > 0) ? (double)sum / count : 0.;
 
   // If less than 1% of pixels were evaluated -> below noise level.
   if (100. * count / (width * height) < 1.) total_score = 0.;

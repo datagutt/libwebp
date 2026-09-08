@@ -40,11 +40,12 @@ function(webp_check_compiler_flag WEBP_SIMD_FLAG ENABLE_SIMD)
       #elif defined(__aarch64__)
       #define WEBP_CAN_HAVE_NEON
       #endif
-      // MIPS intrinsics are not supported on macOS, but we have to define them
-      // so that the check happens.
+      // MIPS and VSX intrinsics are not supported on macOS, but we have to
+      // define them so that the check happens.
       #define WEBP_CAN_HAVE_MIPS32
       #define WEBP_CAN_HAVE_MIPS_DSP_R2
       #define WEBP_CAN_HAVE_MSA
+      #define WEBP_CAN_HAVE_VSX
       #endif
       int main(void) {
         #if ${OSX_CHECK} !defined(WEBP_USE_${WEBP_SIMD_FLAG})
@@ -63,9 +64,9 @@ function(webp_check_compiler_flag WEBP_SIMD_FLAG ENABLE_SIMD)
 endfunction()
 
 # those are included in the names of WEBP_USE_* in c++ code.
-set(WEBP_SIMD_FLAGS "AVX2;SSE41;SSE2;MIPS32;MIPS_DSP_R2;NEON;MSA")
+set(WEBP_SIMD_FLAGS "AVX2;SSE41;SSE2;MIPS32;MIPS_DSP_R2;NEON;MSA;VSX")
 set(WEBP_SIMD_FILE_EXTENSIONS
-    "_avx2.c;_sse41.c;_sse2.c;_mips32.c;_mips_dsp_r2.c;_neon.c;_msa.c")
+    "_avx2.c;_sse41.c;_sse2.c;_mips32.c;_mips_dsp_r2.c;_neon.c;_msa.c;_vsx.c")
 if(MSVC AND CMAKE_C_COMPILER_ID STREQUAL "MSVC")
   # With at least Visual Studio 12 (2013)+ /arch is not necessary to build SSE2
   # or SSE4 code unless a lesser /arch is forced. MSVC does not have a SSE4
@@ -75,14 +76,14 @@ if(MSVC AND CMAKE_C_COMPILER_ID STREQUAL "MSVC")
   if(MSVC_VERSION GREATER_EQUAL 1800 AND NOT CMAKE_C_FLAGS MATCHES "/arch:")
     set(SIMD_ENABLE_FLAGS)
   else()
-    set(SIMD_ENABLE_FLAGS "/arch:AVX2;/arch:AVX;/arch:SSE2;;;;")
+    set(SIMD_ENABLE_FLAGS "/arch:AVX2;/arch:AVX;/arch:SSE2;;;;;")
   endif()
   set(SIMD_DISABLE_FLAGS)
 else()
   set(SIMD_ENABLE_FLAGS
-      "-mavx2;-msse4.1;-msse2;-mips32;-mdspr2;-mfpu=neon;-mmsa")
+      "-mavx2;-msse4.1;-msse2;-mips32;-mdspr2;-mfpu=neon;-mmsa;-mvsx")
   set(SIMD_DISABLE_FLAGS
-      "-mno-avx2;-mno-sse4.1;-mno-sse2;;-mno-dspr2;;-mno-msa")
+      "-mno-avx2;-mno-sse4.1;-mno-sse2;;-mno-dspr2;;-mno-msa;-mno-vsx")
 endif()
 
 set(WEBP_SIMD_FILES_TO_INCLUDE)
@@ -101,13 +102,13 @@ list(LENGTH WEBP_SIMD_FLAGS WEBP_SIMD_FLAGS_LENGTH)
 math(EXPR WEBP_SIMD_FLAGS_RANGE "${WEBP_SIMD_FLAGS_LENGTH} - 1")
 
 foreach(I_SIMD RANGE ${WEBP_SIMD_FLAGS_RANGE})
+  list(GET WEBP_SIMD_FLAGS ${I_SIMD} WEBP_SIMD_FLAG)
+
   # With Emscripten 2.0.9 -msimd128 -mfpu=neon will enable NEON, but the source
   # will fail to compile.
-  if(EMSCRIPTEN AND ${I_SIMD} GREATER_EQUAL 2)
-    break()
+  if(EMSCRIPTEN AND ${WEBP_SIMD_FLAG} STREQUAL "NEON")
+    continue()
   endif()
-
-  list(GET WEBP_SIMD_FLAGS ${I_SIMD} WEBP_SIMD_FLAG)
 
   # First try with no extra flag added as the compiler might have default flags
   # (especially on Android).

@@ -68,6 +68,7 @@ static fixed_y_t clip_bit_depth(int y, int bit_depth) {
 //------------------------------------------------------------------------------
 
 static int RGBToGray(int64_t r, int64_t g, int64_t b) {
+  // r/g/b can reach ~71501 (Smpte428's EOTF), not just the usual <= 65536.
   const int64_t luma = 13933 * r + 46871 * g + 4732 * b + kYuvHalf;
   return (int)(luma >> YUV_FIX);
 }
@@ -151,21 +152,40 @@ static void ImportOneRow(const uint8_t* const r_ptr, const uint8_t* const g_ptr,
   // Convert the rgb_step from a number of bytes to a number of uint8_t or
   // uint16_t values depending the bit depth.
   const int step = (rgb_bit_depth > 8) ? rgb_step / 2 : rgb_step;
-  int i = 0;
   const int w = (pic_width + 1) & ~1;
-  do {
-    const int off = i * step;
-    const int shift = GetPrecisionShift(rgb_bit_depth);
-    if (rgb_bit_depth == 8) {
+  const int shift = GetPrecisionShift(rgb_bit_depth);
+  const int max_val = (1 << rgb_bit_depth) - 1;
+  int i = 0;
+
+  if (rgb_bit_depth == 8) {
+    do {
+      const int off = i * step;
       dst[i + 0 * w] = Shift(r_ptr[off], shift);
       dst[i + 1 * w] = Shift(g_ptr[off], shift);
       dst[i + 2 * w] = Shift(b_ptr[off], shift);
-    } else {
-      dst[i + 0 * w] = Shift(((uint16_t*)r_ptr)[off], shift);
-      dst[i + 1 * w] = Shift(((uint16_t*)g_ptr)[off], shift);
-      dst[i + 2 * w] = Shift(((uint16_t*)b_ptr)[off], shift);
-    }
-  } while (++i < pic_width);
+    } while (++i < pic_width);
+  } else if (rgb_bit_depth < 16) {
+    do {
+      const int off = i * step;
+      int r = ((const uint16_t*)r_ptr)[off];
+      int g = ((const uint16_t*)g_ptr)[off];
+      int b = ((const uint16_t*)b_ptr)[off];
+      dst[i + 0 * w] = Shift(r > max_val ? max_val : r, shift);
+      dst[i + 1 * w] = Shift(g > max_val ? max_val : g, shift);
+      dst[i + 2 * w] = Shift(b > max_val ? max_val : b, shift);
+    } while (++i < pic_width);
+  } else {  // rgb_bit_depth == 16
+    do {
+      const int off = i * step;
+      int r = ((const uint16_t*)r_ptr)[off];
+      int g = ((const uint16_t*)g_ptr)[off];
+      int b = ((const uint16_t*)b_ptr)[off];
+      dst[i + 0 * w] = Shift(r, shift);
+      dst[i + 1 * w] = Shift(g, shift);
+      dst[i + 2 * w] = Shift(b, shift);
+    } while (++i < pic_width);
+  }
+
   if (pic_width & 1) {  // replicate rightmost pixel
     dst[pic_width + 0 * w] = dst[pic_width + 0 * w - 1];
     dst[pic_width + 1 * w] = dst[pic_width + 1 * w - 1];
@@ -207,10 +227,10 @@ static void InterpolateTwoRows(const fixed_y_t* const best_y,
 
 static WEBP_INLINE int RGBToYUVComponent(int r, int g, int b,
                                          const int coeffs[4], int sfix) {
-  const int srounder = 1 << (YUV_FIX + sfix - 1);
-  const int luma =
-      coeffs[0] * r + coeffs[1] * g + coeffs[2] * b + coeffs[3] + srounder;
-  return (luma >> (YUV_FIX + sfix));
+  const int64_t srounder = 1LL << (YUV_FIX + sfix - 1);
+  const int64_t luma = (int64_t)coeffs[0] * r + (int64_t)coeffs[1] * g +
+                       (int64_t)coeffs[2] * b + coeffs[3] + srounder;
+  return (int)(luma >> (YUV_FIX + sfix));
 }
 
 static int ConvertWRGBToYUV(const fixed_y_t* best_y, const fixed_t* best_uv,
@@ -526,6 +546,35 @@ int SharpYuvConvertWithOptions(const void* r_ptr, const void* g_ptr,
   if (rgb_bit_depth > 8 && (rgb_step % 2 != 0 || rgb_stride % 2 != 0)) {
     // Step/stride should be even for uint16_t buffers.
     return 0;
+  }
+  {
+    const uint64_t yuv_bytes = (yuv_bit_depth > 8) ? 2 : 1;
+    const uint64_t uv_width = (width + 1) / 2;
+    const uint64_t abs_step =
+        (uint64_t)((rgb_step < 0) ? -(int64_t)rgb_step : (int64_t)rgb_step);
+    const uint64_t abs_stride =
+        (uint64_t)((rgb_stride < 0) ? -(int64_t)rgb_stride
+                                    : (int64_t)rgb_stride);
+    const uint64_t total_rgb_size = (uint64_t)height * abs_stride;
+    const uint64_t uv_height = (height + 1) / 2;
+    const uint64_t total_y_size = (uint64_t)height * y_stride;
+    const uint64_t total_u_size = uv_height * u_stride;
+    const uint64_t total_v_size = uv_height * v_stride;
+
+    if (y_stride < 0 || (uint64_t)y_stride < (uint64_t)width * yuv_bytes ||
+        u_stride < 0 || (uint64_t)u_stride < uv_width * yuv_bytes ||
+        v_stride < 0 || (uint64_t)v_stride < uv_width * yuv_bytes) {
+      return 0;
+    }
+    if (abs_step == 0 || abs_stride < (uint64_t)width * abs_step) {
+      return 0;
+    }
+    if (total_rgb_size != (size_t)total_rgb_size ||
+        total_y_size != (size_t)total_y_size ||
+        total_u_size != (size_t)total_u_size ||
+        total_v_size != (size_t)total_v_size) {
+      return 0;
+    }
   }
   if (yuv_bit_depth > 8 &&
       (y_stride % 2 != 0 || u_stride % 2 != 0 || v_stride % 2 != 0)) {

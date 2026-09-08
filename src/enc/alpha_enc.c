@@ -59,7 +59,8 @@ static int EncodeLossless(const uint8_t* const data, int width, int height,
   WebPConfig config;
   WebPPicture picture;
 
-  if (!WebPPictureInit(&picture)) return 0;
+  // Both are ABI version checks: do them before allocating.
+  if (!WebPPictureInit(&picture) || !WebPConfigInit(&config)) return 0;
   picture.width = width;
   picture.height = height;
   picture.use_argb = 1;
@@ -70,7 +71,6 @@ static int EncodeLossless(const uint8_t* const data, int width, int height,
   WebPDispatchAlphaToGreen(data, width, picture.width, picture.height,
                            picture.argb, picture.argb_stride);
 
-  if (!WebPConfigInit(&config)) return 0;
   config.lossless = 1;
   // Enable exact, or it would alter RGB values of transparent alpha, which is
   // normally OK but not here since we are not encoding the input image but  an
@@ -356,7 +356,6 @@ static int EncodeAlpha(VP8Encoder* const enc, int quality, int method,
     }
 #if !defined(WEBP_DISABLE_STATS)
     if (pic->stats != NULL) {  // need stats?
-      pic->stats->coded_size += (int)(*output_size);
       enc->sse[3] = sse;
     }
 #endif
@@ -385,7 +384,7 @@ static int CompressAlphaJob(void* arg1, void* unused) {
   }
   if (alpha_size != (uint32_t)alpha_size) {  // Soundness check.
     WebPSafeFree(alpha_data);
-    return 0;
+    return WebPEncodingSetError(enc->pic, VP8_ENC_ERROR_FILE_TOO_BIG);
   }
   enc->alpha_data_size = (uint32_t)alpha_size;
   enc->alpha_data = alpha_data;
